@@ -1,6 +1,6 @@
 # Nature(v2) campaign results — SIMD, time management, usability, Lazy SMP
 
-Scope: Nature(v2) only (MC-Nature). Nothing here is `make install`ed — the live
+Scope: Nature(v2) only (H2-Classical). Nothing here is `make install`ed — the live
 Lichess bot is unchanged throughout. Full plan: `/Users/titojr/.claude/plans/cryptic-wondering-giraffe.md`.
 
 Test protocol: each feature is its own commit-equivalent snapshot

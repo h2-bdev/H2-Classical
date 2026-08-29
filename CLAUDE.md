@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-MC-Nature is a from-scratch, **single-threaded** UCI chess engine (C++20).
+H2-Classical is a from-scratch, **single-threaded** UCI chess engine (C++20).
 Evaluation is a **bullet-trained NNUE** (embedded by default) with a
 hand-crafted eval (HCE) fallback; it also does in-engine **Syzygy** tablebase
 probing. This repo is the engine only — a separate `lichess-bot` harness (not in
@@ -11,18 +11,18 @@ this repo) runs the compiled binary as an external UCI process.
 ## Commands
 
 ```sh
-make               # release build → build/MC-Nature (-O3 -flto -mcpu=apple-m1)
+make               # release build → build/H2-Classical (-O3 -flto -mcpu=apple-m1)
 make perft         # build + run the perft suite (the movegen correctness gate)
-make install       # copy binary → ../lichess-bot/engines/MC-Nature
+make install       # copy binary → ../lichess-bot/engines/H2-Classical
                    # (on macOS also strips com.apple.provenance xattrs + re-signs,
                    #  without which lichess-bot's subprocess spawn is SIGKILL'd)
 make debug         # -O0 -g build
 make clean         # REQUIRED after editing any header — the Makefile has no
                    # header dependency tracking, so a stale LTO link can segfault
 
-./build/MC-Nature          # UCI mode
-./build/MC-Nature perft    # non-interactive perft suite; exit 0 = all pass
-./build/MC-Nature bench [d] # reproducible fixed-depth node "signature" (default 13)
+./build/H2-Classical          # UCI mode
+./build/H2-Classical perft    # non-interactive perft suite; exit 0 = all pass
+./build/H2-Classical bench [d] # reproducible fixed-depth node "signature" (default 13)
 ```
 
 Dev/UCI tokens (pipe or type): `position startpos|fen ... [moves ...]`,
@@ -48,7 +48,7 @@ unmeasured batch regressed and had to be fully reverted. Save the current binary
 to `tools/baselines/` before a change, then A/B it with fastchess (see below)
 and keep the commit only if H1 is accepted (or the result is clearly positive at
 the time cap). Search/eval changes use `tc=8+0.08 elo0=0 elo1=10` with two-sided
-adjudication. Do **not** rebuild `build/MC-Nature` while an SPRT is running —
+adjudication. Do **not** rebuild `build/H2-Classical` while an SPRT is running —
 fastchess re-spawns the binary per game and would switch mid-match.
 
 ## Architecture

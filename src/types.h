@@ -1,5 +1,5 @@
 #pragma once
-// MC-Nature — core type definitions.
+// H2-Classical — core type definitions.
 // Square layout is Little-Endian Rank-File (LERF): a1=0, h1=7, a8=56, h8=63.
 
 #include <cstdint>
