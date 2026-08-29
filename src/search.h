@@ -36,6 +36,11 @@ void clear();           // reset history / killers / TT generation between games
 // Runs iterative deepening on pos (blocking) and prints UCI info + bestmove.
 void think(Position& pos, const Limits& limits);
 
+// Result of the last think(), for callers that consume a search programmatically
+// rather than over UCI (datagen). best_value() is side-to-move POV.
+Move  best_move();
+Value best_value();
+
 // ---- Runtime-tunable search parameters (for SPSA) ----
 // set_tune returns false for an unknown name (so the caller can ignore it).
 // print_tune_options emits one UCI "option name ... type spin ..." line each.

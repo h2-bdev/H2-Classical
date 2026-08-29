@@ -25,29 +25,47 @@ int64_t nodes = 0;
 // X-macro table: NAME, default, min, max. Every default reproduces the shipped
 // behaviour exactly, so a build with all defaults keeps the bench signature.
 // LmrDivX100 is the LMR log-divisor times 100 (210 -> 2.10).
-// Defaults below are the SPSA-tuned values (D-round 2026-07-31); min/max unchanged.
+//
+// Defaults below are the SPSA-tuned values from the 2026-08-15 round (229
+// iterations, 8 games/iter @50k nodes), tuned on top of the 2026-07-31 round.
+// UNVERIFIED until the SPRT vs tools/baselines/cc-spsa2-base finishes.
+//
+// CAVEAT: NullBase came out pinned at its upper bound (6) -- SPSA wanted to
+// push past the range, so that one value is a wall, not a converged optimum.
+// Widen the range before any future tuning round.
+//
+// To revert to the 2026-07-31 defaults (bench returns to 1703779):
+//   RfpMargin 76, RfpMarginImp 54, RazorMargin 300, NullBase 5, NullEvalDiv 162,
+//   ProbCutMargin 250, ProbCutImp 67, FutBase 158, FutScale 86,
+//   HistPruneMul 4134, SeeCapMul 64, SeeQuietMul 60, LmrHistDiv 7141,
+//   LmrDivX100 216, AspDelta 13, HistBonusMul 5, HistBonusMax 7051
+//   (NullDepthDiv/SingularMul/LmpBase/LmpImpBase unchanged by this round)
 #define TUNE_PARAMS(X) \
-    X(RfpMargin,       76,   20,   200) \
-    X(RfpMarginImp,    54,   20,   200) \
-    X(RazorMargin,    300,  100,   600) \
-    X(NullBase,         5,    1,     6) \
+    X(RfpMargin,       70,   20,   200) \
+    X(RfpMarginImp,    57,   20,   200) \
+    X(RazorMargin,    329,  100,   600) \
+    X(NullBase,         6,    1,     6) \
     X(NullDepthDiv,     5,    3,    12) \
-    X(NullEvalDiv,    162,   80,   400) \
-    X(ProbCutMargin,  250,  120,   400) \
-    X(ProbCutImp,      67,    0,   140) \
-    X(FutBase,        158,   50,   350) \
-    X(FutScale,        86,   40,   220) \
-    X(HistPruneMul,  4134, 1500,  8000) \
-    X(SeeCapMul,       64,   15,   130) \
-    X(SeeQuietMul,     60,   15,   130) \
-    X(LmrHistDiv,    7141, 3072, 16384) \
-    X(LmrDivX100,     216,  160,   280) \
-    X(AspDelta,        13,    6,    30) \
-    X(HistBonusMul,     5,    2,     9) \
-    X(HistBonusMax,  7051, 4000, 14000) \
+    X(NullEvalDiv,    165,   80,   400) \
+    X(ProbCutMargin,  249,  120,   400) \
+    X(ProbCutImp,      88,    0,   140) \
+    X(FutBase,        120,   50,   350) \
+    X(FutScale,       101,   40,   220) \
+    X(HistPruneMul,  5058, 1500,  8000) \
+    X(SeeCapMul,       54,   15,   130) \
+    X(SeeQuietMul,     54,   15,   130) \
+    X(LmrHistDiv,    7092, 3072, 16384) \
+    X(LmrDivX100,     229,  160,   280) \
+    X(AspDelta,        15,    6,    30) \
+    X(HistBonusMul,     7,    2,     9) \
+    X(HistBonusMax,  6951, 4000, 14000) \
     X(SingularMul,      2,    1,     5) \
     X(LmpBase,          4,    1,     7) \
-    X(LmpImpBase,       4,    1,     9)
+    X(CutoffCntMax,     3,    1,     8) \
+    X(LmpImpBase,       4,    1,     9) \
+    X(CorrWPawn,      128,    0,   256) \
+    X(CorrWNonPawn,    64,    0,   256) \
+    X(CorrWCont,       64,    0,   256)
 
 namespace Tune {
 #define TUNE_DEFINE(name, def, lo, hi) int name = def;
@@ -65,6 +83,12 @@ struct Stack {
     Piece movedPiece;
     Value staticEval;
     int   ply;
+    // How many beta cutoffs this node has produced. Read by the PARENT's LMR:
+    // a child that keeps failing high is an "easy" subtree where the first
+    // move is usually good enough, so the parent can afford to reduce its
+    // later moves harder. Zeroed by the memset in think()/think_helper() and
+    // reset for the child on every node entry.
+    int   cutoffCnt;
 };
 
 // ---- Shared, read-mostly tables (safe across Lazy-SMP worker threads) -----
@@ -79,6 +103,17 @@ constexpr int CorrHistSize        = 16384;   // power of two
 constexpr int CorrHistGrain       = 256;     // fixed-point scale of stored entries
 constexpr int CorrHistWeightScale = 256;     // running-average denominator
 constexpr int CorrHistMax         = 256 * 32; // clamp on stored entry
+
+// Which earlier plies contribute continuation history, ascending. 1 and 2 are
+// the classic pair; 4 and 6 add longer-range move-sequence context.
+constexpr int ContPlies[] = { 1, 2, 4, 6 };
+
+// Slots of padding before ply 0 on the search stack, so (ss - back) is always
+// readable for every ply in ContPlies. Deepening ContPlies without raising this
+// is a silent buffer underrun -- hence the static_assert.
+constexpr int StackPad = 6;
+static_assert(ContPlies[sizeof(ContPlies) / sizeof(ContPlies[0]) - 1] <= StackPad,
+              "StackPad must cover the deepest entry in ContPlies");
 
 constexpr int MAX_MULTIPV = 8;
 
@@ -142,9 +177,15 @@ public:
     int  contHistory[PIECE_NB][SQUARE_NB][PIECE_NB][SQUARE_NB];
     // Capture history: [movedPiece][to][capturedType].
     int  captureHistory[PIECE_NB][SQUARE_NB][PIECE_TYPE_NB];
-    // Pawn-structure eval correction history: learns the (search - static)
-    // residual keyed by the pawn Zobrist key, de-biasing future static evals.
+    // Eval correction histories: each learns the (search - static) residual
+    // keyed by a different projection of the position, de-biasing future static
+    // evals. Their corrections are summed with tunable weights in adjust_eval.
+    //   pawn     - pawn structure (the original, and still the strongest single key)
+    //   nonPawn  - [side to move][piece colour], keyed by that colour's non-pawn material
+    //   cont     - the previous move (prevPiece, prevTo), i.e. a continuation key
     int  pawnCorrHist[COLOR_NB][CorrHistSize];
+    int  nonPawnCorrHist[COLOR_NB][COLOR_NB][CorrHistSize];
+    int  contCorrHist[PIECE_NB][SQUARE_NB];
 
     Move  rootBestMove = MOVE_NONE;
     Value rootBestValue = -VALUE_INFINITE;
@@ -184,8 +225,8 @@ public:
     int   quiet_history(Color us, Stack* ss, Piece movedPiece, Move m);
     void  update_continuation(Stack* ss, Piece movedPiece, Move m, int bonus);
 
-    Value adjust_eval(const Position& pos, Value staticEval);
-    void  update_pawn_corr(const Position& pos, int depth, int diff);
+    Value adjust_eval(const Position& pos, Stack* ss, Value staticEval);
+    void  update_corr(const Position& pos, Stack* ss, int depth, int diff);
 
     // Draw score from `stm`'s point of view (this engine's values are always
     // side-to-move POV). At the default Contempt=0 this is exactly
@@ -207,7 +248,23 @@ public:
     // stops when the shared `stop` flag is set (by its own hard-limit check
     // or by the main thread finishing its own iteration loop).
     void  think_helper(Position pos, const Limits& lim, int depthOffset);
+
+    // Zero every learned table. Called on `ucinewgame` for EVERY worker, not
+    // just the main one -- see Search::clear(). Kept as a member so a table
+    // added to this class in future is reset by adding one line here, next to
+    // its declaration, rather than in a free function that is easy to forget.
+    void  clear_tables();
 };
+
+void SearchWorker::clear_tables() {
+    std::memset(mainHistory,     0, sizeof(mainHistory));
+    std::memset(counterMoves,    0, sizeof(counterMoves));
+    std::memset(contHistory,     0, sizeof(contHistory));
+    std::memset(captureHistory,  0, sizeof(captureHistory));
+    std::memset(pawnCorrHist,    0, sizeof(pawnCorrHist));
+    std::memset(nonPawnCorrHist, 0, sizeof(nonPawnCorrHist));
+    std::memset(contCorrHist,    0, sizeof(contCorrHist));
+}
 
 // Single static worker for today's single-threaded engine, plus a second
 // worker used only when Threads=2. Zero-initialized, static-storage-duration
@@ -278,7 +335,7 @@ void SearchWorker::update_capture_history(const Position& pos, Move m, int bonus
 // Combined quiet-move history: butterfly + 1-ply and 2-ply continuation.
 int SearchWorker::quiet_history(Color us, Stack* ss, Piece movedPiece, Move m) {
     int h = mainHistory[us][from_sq(m)][to_sq(m)];
-    for (int back : { 1, 2 }) {
+    for (int back : ContPlies) {
         Move pm = (ss - back)->currentMove;
         if (pm != MOVE_NONE && pm != MOVE_NULL)
             h += contHistory[(ss - back)->movedPiece][to_sq(pm)][movedPiece][to_sq(m)];
@@ -288,7 +345,7 @@ int SearchWorker::quiet_history(Color us, Stack* ss, Piece movedPiece, Move m) {
 
 void SearchWorker::update_continuation(Stack* ss, Piece movedPiece, Move m, int bonus) {
     bonus = std::clamp(bonus, -8000, 8000);
-    for (int back : { 1, 2 }) {
+    for (int back : ContPlies) {
         Move pm = (ss - back)->currentMove;
         if (pm != MOVE_NONE && pm != MOVE_NULL) {
             int& e = contHistory[(ss - back)->movedPiece][to_sq(pm)][movedPiece][to_sq(m)];
@@ -299,19 +356,48 @@ void SearchWorker::update_continuation(Stack* ss, Piece movedPiece, Move m, int 
 
 // ---- Eval correction history -----------------------------------------------
 // Apply the learned pawn-structure residual to a raw static eval.
-Value SearchWorker::adjust_eval(const Position& pos, Value staticEval) {
-    int delta = pawnCorrHist[pos.side_to_move()][pos.pawn_key() & (CorrHistSize - 1)] / CorrHistGrain;
+Value SearchWorker::adjust_eval(const Position& pos, Stack* ss, Value staticEval) {
+    const Color us = pos.side_to_move();
+
+    int pawn = pawnCorrHist[us][pos.pawn_key() & (CorrHistSize - 1)];
+    int npw  = nonPawnCorrHist[us][WHITE][pos.non_pawn_key(WHITE) & (CorrHistSize - 1)];
+    int npb  = nonPawnCorrHist[us][BLACK][pos.non_pawn_key(BLACK) & (CorrHistSize - 1)];
+
+    // (ss-1) is always readable: the stack is allocated with two slots of
+    // padding and memset, and (ss-1)/(ss-2) have currentMove = MOVE_NONE.
+    int cont = 0;
+    Move pm = (ss - 1)->currentMove;
+    if (pm != MOVE_NONE && pm != MOVE_NULL)
+        cont = contCorrHist[(ss - 1)->movedPiece][to_sq(pm)];
+
+    // Weights are /128, so the default CorrWPawn=128 reproduces the old
+    // pawn-only magnitude exactly and the other keys layer on at half strength.
+    int delta = (Tune::CorrWPawn * pawn + Tune::CorrWNonPawn * (npw + npb)
+                 + Tune::CorrWCont * cont) / (128 * CorrHistGrain);
+
     Value v = staticEval + delta;
     return std::clamp(v, Value(VALUE_MATED_IN_MAX_PLY + 1), Value(VALUE_MATE_IN_MAX_PLY - 1));
 }
 
 // Blend the residual (searchScore - correctedStatic) into the running average.
-void SearchWorker::update_pawn_corr(const Position& pos, int depth, int diff) {
-    int& entry = pawnCorrHist[pos.side_to_move()][pos.pawn_key() & (CorrHistSize - 1)];
-    int scaledDiff = diff * CorrHistGrain;
-    int weight = std::min(depth + 1, 16);
-    entry = (entry * (CorrHistWeightScale - weight) + scaledDiff * weight) / CorrHistWeightScale;
-    entry = std::clamp(entry, -CorrHistMax, CorrHistMax);
+void SearchWorker::update_corr(const Position& pos, Stack* ss, int depth, int diff) {
+    const Color us = pos.side_to_move();
+    const int scaledDiff = diff * CorrHistGrain;
+    const int weight = std::min(depth + 1, 16);
+
+    // Every key that described this position learns the same residual.
+    auto blend = [&](int& entry) {
+        entry = (entry * (CorrHistWeightScale - weight) + scaledDiff * weight) / CorrHistWeightScale;
+        entry = std::clamp(entry, -CorrHistMax, CorrHistMax);
+    };
+
+    blend(pawnCorrHist[us][pos.pawn_key() & (CorrHistSize - 1)]);
+    blend(nonPawnCorrHist[us][WHITE][pos.non_pawn_key(WHITE) & (CorrHistSize - 1)]);
+    blend(nonPawnCorrHist[us][BLACK][pos.non_pawn_key(BLACK) & (CorrHistSize - 1)]);
+
+    Move pm = (ss - 1)->currentMove;
+    if (pm != MOVE_NONE && pm != MOVE_NULL)
+        blend(contCorrHist[(ss - 1)->movedPiece][to_sq(pm)]);
 }
 
 Value SearchWorker::draw_value(Color stm) const {
@@ -352,7 +438,7 @@ Value SearchWorker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta) {
         rawEval   = VALUE_NONE;
     } else {
         rawEval   = evaluate(pos);
-        bestValue = adjust_eval(pos, rawEval); // correction-history-adjusted stand-pat
+        bestValue = adjust_eval(pos, ss, rawEval); // correction-history-adjusted stand-pat
         if (bestValue >= beta)
             return bestValue;
         if (bestValue > alpha)
@@ -400,8 +486,9 @@ Value SearchWorker::qsearch(Position& pos, Stack* ss, Value alpha, Value beta) {
         return mated_in(ply); // checkmate
 
     Bound b = bestValue >= beta ? BOUND_LOWER : BOUND_UPPER;
+    // qsearch never opens a PV of its own; it only propagates an existing flag.
     tte->save(pos.key(), score_to_tt(bestValue, ply), b, 0, bestMove,
-              rawEval, TT.generation());
+              rawEval, ttHit && tte->is_pv(), TT.generation());
     return bestValue;
 }
 
@@ -438,11 +525,21 @@ Value SearchWorker::alphabeta(Position& pos, Stack* ss, Value alpha, Value beta,
     const Color us = pos.side_to_move();
     const Move  excludedMove = ss->excludedMove;
 
+    // Fresh cutoff counter for the child; it accumulates only within this
+    // node's own move loop, not across siblings.
+    (ss + 1)->cutoffCnt = 0;
+
     // TT probe.
     bool ttHit = false;
     TTEntry* tte = TT.probe(pos.key(), ttHit);
     Value ttValue = ttHit ? score_from_tt(tte->value(), ply) : VALUE_NONE;
     Move  ttMove  = rootNode ? rootBestMove : (ttHit ? tte->move() : MOVE_NONE);
+
+    // "This node is, or once was, on a principal variation." A PV node is
+    // always ttPv; a non-PV node inherits the flag from the TT. It marks lines
+    // the search has already judged important, which is exactly where reducing
+    // aggressively is most likely to miss something -- see LMR below.
+    bool ttPv = pvNode || (ttHit && tte->is_pv());
 
     // During a singular verification search we must not take the TT cutoff for
     // this key (it would just return ttValue and defeat the probe).
@@ -472,7 +569,7 @@ Value SearchWorker::alphabeta(Position& pos, Stack* ss, Value alpha, Value beta,
                 || (tbBound == BOUND_UPPER && tbValue <= alpha)) {
                 tte->save(pos.key(), score_to_tt(tbValue, ply), tbBound,
                           std::min(depth + 6, MAX_PLY - 1), MOVE_NONE,
-                          VALUE_NONE, TT.generation());
+                          VALUE_NONE, ttPv, TT.generation());
                 return tbValue;
             }
         }
@@ -483,7 +580,7 @@ Value SearchWorker::alphabeta(Position& pos, Stack* ss, Value alpha, Value beta,
     Value unadjustedEval = inCheck ? VALUE_NONE
                      : (ttHit && tte->eval() != VALUE_NONE) ? tte->eval()
                      : evaluate(pos);
-    Value staticEval = inCheck ? VALUE_NONE : adjust_eval(pos, unadjustedEval);
+    Value staticEval = inCheck ? VALUE_NONE : adjust_eval(pos, ss, unadjustedEval);
     ss->staticEval = staticEval;
 
     bool improving = !inCheck && ply >= 2 && (ss - 2)->staticEval != VALUE_NONE
@@ -554,7 +651,7 @@ Value SearchWorker::alphabeta(Position& pos, Stack* ss, Value alpha, Value beta,
 
                 if (v >= probCutBeta) {
                     tte->save(pos.key(), score_to_tt(v, ply), BOUND_LOWER, depth - 3, m,
-                              unadjustedEval, TT.generation());
+                              unadjustedEval, ttPv, TT.generation());
                     return v;
                 }
             }
@@ -649,7 +746,25 @@ Value SearchWorker::alphabeta(Position& pos, Stack* ss, Value alpha, Value beta,
                 if (!pvNode && v < singularBeta - 24) // clearly singular → double-extend
                     extension = 2;
             } else if (singularBeta >= beta) {
-                return singularBeta;                  // multi-cut
+                // Multi-cut. Note this tests the MARGIN (ttValue - SingularMul
+                // *depth) against beta, not what the verification search
+                // returned, so it fires rarely at high depth.
+                //
+                // The obvious strengthening -- `v >= beta`, returning v, which
+                // strictly subsumes this test -- was implemented and MEASURED
+                // on 2026-08-28 and it LOST: -7.24 +/- 18.59 Elo over 243 games
+                // (LOS 22%, LLR -0.44), after a clean smoke at 45.0%. Reverted.
+                //
+                // It was not a bug -- engine-doctor reviewed the logic and
+                // passed it, and the bench moved coherently (1505550 ->
+                // 1532059, up because the noisier returned score drove more
+                // aspiration re-searches higher in the tree). It was simply a
+                // worse heuristic: cutting more often on a half-depth,
+                // excluded-move, narrow-window result trades accuracy for
+                // nodes at a bad exchange rate here.
+                //
+                // Full write-up in TODO.md 6b. Do not re-derive this.
+                return singularBeta;
             } else if (ttValue >= beta) {
                 extension = -1;                       // negative extension
             }
@@ -671,6 +786,8 @@ Value SearchWorker::alphabeta(Position& pos, Stack* ss, Value alpha, Value beta,
         if (depth >= 3 && moveCount >= 2 && quiet && !givesCheck) {
             int r = Reductions[std::min(63, depth)][std::min(63, moveCount)];
             if (pvNode) --r;
+            if (ttPv) --r;      // this line was once a PV -- reduce it less
+            if ((ss + 1)->cutoffCnt > Tune::CutoffCntMax) ++r; // easy subtree -- reduce more
             if (cutNode) ++r;
             if (!improving) ++r;
             r -= std::clamp(histScore / Tune::LmrHistDiv, -2, 2); // strong history reduces less
@@ -702,8 +819,13 @@ Value SearchWorker::alphabeta(Position& pos, Stack* ss, Value alpha, Value beta,
                 }
                 if (pvNode)
                     update_pv(ply, m);
-                if (v >= beta)
+                if (v >= beta) {
+                    // Weight a cutoff found WITHOUT a TT move more heavily:
+                    // with no hint to guide it, an immediate fail-high is
+                    // stronger evidence that this subtree is easy.
+                    ss->cutoffCnt += 1 + (ttMove == MOVE_NONE);
                     break;
+                }
                 alpha = v;
             }
         }
@@ -768,10 +890,10 @@ Value SearchWorker::alphabeta(Position& pos, Stack* ss, Value alpha, Value beta,
         && std::abs(bestValue) < VALUE_MATE_IN_MAX_PLY
         && !(b == BOUND_LOWER && bestValue <= staticEval)
         && !(b == BOUND_UPPER && bestValue >= staticEval))
-        update_pawn_corr(pos, depth, bestValue - staticEval);
+        update_corr(pos, ss, depth, bestValue - staticEval);
 
     tte->save(pos.key(), score_to_tt(bestValue, ply), b, depth, bestMove,
-              inCheck ? VALUE_NONE : unadjustedEval, TT.generation());
+              inCheck ? VALUE_NONE : unadjustedEval, ttPv, TT.generation());
 
     return bestValue;
 }
@@ -853,14 +975,17 @@ void SearchWorker::think(Position& pos, const Limits& lim) {
     NNUE::set_active(true);
     NNUE::refresh(pos);
 
-    Stack stackMem[MAX_PLY + 4];
+    // StackPad slots of padding before ply 0, because continuation history
+    // reads (ss-1), (ss-2), (ss-4) and (ss-6). Widening the ply set WITHOUT
+    // widening this is a buffer underrun that no test would reliably catch.
+    Stack stackMem[MAX_PLY + StackPad + 2];
     std::memset(stackMem, 0, sizeof(stackMem));
-    Stack* ss = stackMem + 2; // room for (ss-2)
-    for (int i = -2; i <= MAX_PLY; ++i)
+    Stack* ss = stackMem + StackPad;
+    for (int i = -StackPad; i <= MAX_PLY; ++i)
         (ss + i)->ply = i;
-    for (int i = 0; i < 2; ++i) {
-        (ss - 1 - i)->staticEval = VALUE_NONE;
-        (ss - 1 - i)->currentMove = MOVE_NONE;
+    for (int i = 0; i < StackPad; ++i) {
+        (ss - 1 - i)->staticEval = VALUE_NONE;   // memset covers currentMove
+        (ss - 1 - i)->currentMove = MOVE_NONE;   // (MOVE_NONE == 0) but be explicit
     }
 
     Value prevScore = -VALUE_INFINITE;
@@ -883,9 +1008,26 @@ void SearchWorker::think(Position& pos, const Limits& lim) {
 
     int mpvCount = std::clamp(MultiPV, 1, MAX_MULTIPV);
 
+    // Reporting state for the final `info` line emitted after this loop.
+    //
+    // When the last iteration aborts mid-search, print_info() is never reached
+    // for that depth, so the last line a GUI saw describes depth N while the
+    // `bestmove` below comes from the partial depth N+1 search. fastchess
+    // reported this as "Bestmove does not match" 23/38/31/5 times across four
+    // matches, in BOTH dev and base -- it predates all current work.
+    //
+    // The move PLAYED is correct: a stopped child returns VALUE_ZERO before
+    // rootBestMove is touched (see the stop check in alphabeta's move loop), so
+    // a partial result cannot poison the root. Only the REPORT was stale. That
+    // still matters -- it corrupts PGN annotations, GUI display, and
+    // tools/curate_pgn.py, which is the input to the game-analyst agent.
+    Move lastReportedMove  = MOVE_NONE;
+    int  lastAttemptedDepth = 1;
+
     for (int depth = 1; depth <= maxDepth; ++depth) {
         Value score = -VALUE_INFINITE; // slot-0 (primary line) score for this depth
         bool aborted = false;
+        lastAttemptedDepth = depth;
 
         // MultiPV: slot k re-searches the root excluding slots 0..k-1's moves
         // (the standard root-exclusion technique). At the default MultiPV=1
@@ -940,6 +1082,8 @@ void SearchWorker::think(Position& pos, const Limits& lim) {
             }
 
             print_info(depth, slotScore, Time.elapsed(), pvIdx, mpvPV[pvIdx], mpvPVLen[pvIdx]);
+            if (pvIdx == 0)
+                lastReportedMove = mpvMove[0];
         }
 
         multiPvExcludedCount = 0;
@@ -1002,6 +1146,25 @@ void SearchWorker::think(Position& pos, const Limits& lim) {
         lastIterScore = score;
     }
 
+    // Final `info` line when the last iteration aborted and changed the root
+    // move after the last one we printed. Pure reporting -- no search state is
+    // read or written beyond the PV table, so the bench signature is unchanged.
+    if (rootBestMove != MOVE_NONE && rootBestMove != lastReportedMove) {
+        // Keep the PV consistent with the move actually played. On an abort the
+        // PV table was last written by update_pv() alongside the rootBestMove
+        // update, so head and move normally agree -- but an abort inside an
+        // aspiration re-search can leave a line from the previous window. If
+        // they disagree, report the single move we are certain of rather than a
+        // longer line we are not. This also fixes the `ponder` move below,
+        // which reads pvTable[0][1] and would otherwise suggest a reply to a
+        // move the engine did not play.
+        if (pvLen[0] < 1 || pvTable[0][0] != rootBestMove) {
+            pvTable[0][0] = rootBestMove;
+            pvLen[0] = 1;
+        }
+        print_info(lastAttemptedDepth, rootBestValue, Time.elapsed(), 0, pvTable[0], pvLen[0]);
+    }
+
     NNUE::set_active(false); // leave incremental mode; non-search do_move stays cheap
 
     // Whatever reason this thread stopped (soft limit, max depth, mate,
@@ -1015,8 +1178,12 @@ void SearchWorker::think(Position& pos, const Limits& lim) {
     char buf[6];
     move_to_uci(rootBestMove != MOVE_NONE ? rootBestMove : MOVE_NONE, buf);
     std::cout << "bestmove " << buf;
-    // pvTable[0][1] is the predicted reply from the primary line's last
-    // completed iteration — already computed, just never emitted before.
+    // pvTable[0][1] is the predicted reply from the primary line. Normally that
+    // is the last COMPLETED iteration; if the final iteration aborted, the
+    // block above has already reconciled pvTable[0] with the move actually
+    // played, so this stays consistent with `bestmove` either way. (The old
+    // comment here claimed "last completed iteration" unconditionally, which
+    // was wrong precisely in the abort case.)
     if (pvLen[0] > 1) {
         char pbuf[6];
         move_to_uci(pvTable[0][1], pbuf);
@@ -1044,14 +1211,17 @@ void SearchWorker::think_helper(Position pos, const Limits& lim, int depthOffset
     NNUE::set_active(true);
     NNUE::refresh(pos);
 
-    Stack stackMem[MAX_PLY + 4];
+    // StackPad slots of padding before ply 0, because continuation history
+    // reads (ss-1), (ss-2), (ss-4) and (ss-6). Widening the ply set WITHOUT
+    // widening this is a buffer underrun that no test would reliably catch.
+    Stack stackMem[MAX_PLY + StackPad + 2];
     std::memset(stackMem, 0, sizeof(stackMem));
-    Stack* ss = stackMem + 2;
-    for (int i = -2; i <= MAX_PLY; ++i)
+    Stack* ss = stackMem + StackPad;
+    for (int i = -StackPad; i <= MAX_PLY; ++i)
         (ss + i)->ply = i;
-    for (int i = 0; i < 2; ++i) {
-        (ss - 1 - i)->staticEval = VALUE_NONE;
-        (ss - 1 - i)->currentMove = MOVE_NONE;
+    for (int i = 0; i < StackPad; ++i) {
+        (ss - 1 - i)->staticEval = VALUE_NONE;   // memset covers currentMove
+        (ss - 1 - i)->currentMove = MOVE_NONE;   // (MOVE_NONE == 0) but be explicit
     }
 
     Value prevScore = -VALUE_INFINITE;
@@ -1107,6 +1277,14 @@ void set_multipv(int n) {
     mainWorker.MultiPV = std::clamp(n, 1, MAX_MULTIPV);
 }
 
+Move best_move() {
+    return mainWorker.rootBestMove;
+}
+
+Value best_value() {
+    return mainWorker.rootBestValue;
+}
+
 void set_threads(int n) {
     NumThreads = std::clamp(n, 1, 2);
 }
@@ -1138,11 +1316,15 @@ void print_tune_options(std::ostream& os) {
 }
 
 void clear() {
-    std::memset(mainWorker.mainHistory, 0, sizeof(mainWorker.mainHistory));
-    std::memset(mainWorker.counterMoves, 0, sizeof(mainWorker.counterMoves));
-    std::memset(mainWorker.contHistory, 0, sizeof(mainWorker.contHistory));
-    std::memset(mainWorker.captureHistory, 0, sizeof(mainWorker.captureHistory));
-    std::memset(mainWorker.pawnCorrHist, 0, sizeof(mainWorker.pawnCorrHist));
+    // BOTH workers. Before 2026-08-20 this reset mainWorker only, so at
+    // Threads=2 the helper carried its history and all three correction
+    // histories across `ucinewgame` -- i.e. across games, for the whole life
+    // of a long-running bot process. That is not hypothetical: the live
+    // lichess-bot config sets Threads=2, so the leak was active in real games.
+    // (It is still a no-op at Threads=1, where the helper never searches, so
+    // the bench signature is unaffected.)
+    mainWorker.clear_tables();
+    helperWorker.clear_tables();
     TT.new_search();
 }
 

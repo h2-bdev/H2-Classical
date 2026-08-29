@@ -19,3 +19,4 @@ src/nnue/*.o
 # Editor / tooling artifacts
 .vscode/
 .clangd
+CLAUDE.md

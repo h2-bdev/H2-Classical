@@ -6,7 +6,7 @@
 
 TranspositionTable TT;
 
-void TTEntry::save(uint64_t key, Value v, Bound b, int d, Move m, Value ev, uint8_t generation) {
+void TTEntry::save(uint64_t key, Value v, Bound b, int d, Move m, Value ev, bool pv, uint8_t generation) {
     uint16_t k16 = uint16_t(key);
     uint16_t existingKey16 = key16 ^ data_mix(move16, value16, eval16, depth8, genBound8);
     bool samePos = (k16 == existingKey16);
@@ -15,12 +15,19 @@ void TTEntry::save(uint64_t key, Value v, Bound b, int d, Move m, Value ev, uint
     if (m != MOVE_NONE || !samePos)
         move16 = uint16_t(m);
 
+    // The pv flag is STICKY for a position: once a node has been part of a PV
+    // line, a later non-PV visit must not clear it. Otherwise the flag decays
+    // to noise as the same position is re-reached through null-window searches,
+    // and it stops meaning "this line mattered".
+    if (samePos)
+        pv = pv || is_pv();
+
     // Replace unless the incoming entry is shallower for the same position.
     if (b == BOUND_EXACT || !samePos || d + 4 > depth8) {
         value16   = int16_t(v);
         eval16    = int16_t(ev);
         depth8    = int8_t(d);
-        genBound8 = uint8_t(generation | b);
+        genBound8 = uint8_t(generation | (pv ? 0x4 : 0) | b);
     }
 
     // key16 always re-derived from the final field values (move16 may have
@@ -57,7 +64,10 @@ int TranspositionTable::hashfull() const {
         for (int j = 0; j < ClusterSize; ++j)
             // "Full" = written under the current search generation (matches the
             // low bound bits' generation tag, ignoring the bound bits themselves).
-            if ((table[i].entry[j].genBound8 & 0xFC) == (generation8 & 0xFC)
+            // 0xF8 (not 0xFC): bit 2 now holds ttPv, so it must be masked out
+            // of the generation comparison or a PV entry reads as a different
+            // generation than an identical non-PV one.
+            if ((table[i].entry[j].genBound8 & 0xF8) == (generation8 & 0xF8)
                 && table[i].entry[j].genBound8 != 0)
                 ++cnt;
     return int(size_t(cnt) * 1000 / (sampleClusters * ClusterSize));
@@ -79,8 +89,8 @@ TTEntry* TranspositionTable::probe(uint64_t key, bool& found) const {
     // Pick the shallowest / oldest entry as the replacement target.
     TTEntry* replace = first;
     for (int i = 1; i < ClusterSize; ++i) {
-        int replAge = (generation8 - (replace->genBound8 & 0xFC)) & 0xFF;
-        int candAge = (generation8 - (first[i].genBound8 & 0xFC)) & 0xFF;
+        int replAge = (generation8 - (replace->genBound8 & 0xF8)) & 0xFF;
+        int candAge = (generation8 - (first[i].genBound8 & 0xF8)) & 0xFF;
         if (replace->depth8 - replAge > first[i].depth8 - candAge)
             replace = &first[i];
     }

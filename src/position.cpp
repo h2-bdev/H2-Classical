@@ -112,11 +112,14 @@ void Position::set(const std::string& fen, StateInfo* si) {
     // Derived state.
     st->key = 0;
     st->pawnKey = 0;
+    st->nonPawnKey[WHITE] = st->nonPawnKey[BLACK] = 0;
     for (Square s = SQ_A1; s <= SQ_H8; ++s)
         if (board[s] != NO_PIECE) {
             st->key ^= Zobrist::psq[board[s]][s];
             if (type_of(board[s]) == PAWN)
                 st->pawnKey ^= Zobrist::psq[board[s]][s];
+            else
+                st->nonPawnKey[color_of(board[s])] ^= Zobrist::psq[board[s]][s];
         }
     if (st->epSquare != SQ_NONE)
         st->key ^= Zobrist::enpassant[file_of(st->epSquare)];
@@ -273,6 +276,8 @@ void Position::do_move(Move m, StateInfo& newSt) {
     newSt.previous       = st;
     newSt.key            = st->key;
     newSt.pawnKey        = st->pawnKey;
+    newSt.nonPawnKey[WHITE] = st->nonPawnKey[WHITE];
+    newSt.nonPawnKey[BLACK] = st->nonPawnKey[BLACK];
     newSt.castlingRights = st->castlingRights;
     newSt.epSquare       = st->epSquare;
     newSt.rule50         = st->rule50;
@@ -281,6 +286,7 @@ void Position::do_move(Move m, StateInfo& newSt) {
 
     uint64_t key = st->key ^ Zobrist::side;
     uint64_t pawnKey = st->pawnKey;
+    uint64_t npKey[COLOR_NB] = { st->nonPawnKey[WHITE], st->nonPawnKey[BLACK] };
     ++st->rule50;
     ++st->pliesFromNull;
     ++gamePly;
@@ -297,6 +303,8 @@ void Position::do_move(Move m, StateInfo& newSt) {
         key ^= Zobrist::psq[captured][capsq];
         if (type_of(captured) == PAWN)
             pawnKey ^= Zobrist::psq[captured][capsq];
+        else
+            npKey[them] ^= Zobrist::psq[captured][capsq];
         if (nn) NNUE::remove_feature(captured, capsq);
         remove_piece(capsq);
         st->rule50 = 0;
@@ -312,6 +320,8 @@ void Position::do_move(Move m, StateInfo& newSt) {
     // Move the piece (king for castling).
     move_piece(from, to);
     key ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
+    if (type_of(pc) != PAWN)   // promotion fixes up the 'to' square below
+        npKey[us] ^= Zobrist::psq[pc][from] ^ Zobrist::psq[pc][to];
     if (nn) {
         NNUE::remove_feature(pc, from);
         if (mt != PROMOTION)              // promotion adds the promoted piece below
@@ -326,6 +336,7 @@ void Position::do_move(Move m, StateInfo& newSt) {
         move_piece(rFrom, rTo);
         Piece rook = make_piece(us, ROOK);
         key ^= Zobrist::psq[rook][rFrom] ^ Zobrist::psq[rook][rTo];
+        npKey[us] ^= Zobrist::psq[rook][rFrom] ^ Zobrist::psq[rook][rTo];
         if (nn) {
             NNUE::remove_feature(rook, rFrom);
             NNUE::add_feature(rook, rTo);
@@ -348,6 +359,7 @@ void Position::do_move(Move m, StateInfo& newSt) {
             remove_piece(to);
             put_piece(promoted, to);
             key ^= Zobrist::psq[pc][to] ^ Zobrist::psq[promoted][to];
+            npKey[us] ^= Zobrist::psq[promoted][to];  // pawn's departure is in pawnKey
             if (nn) NNUE::add_feature(promoted, to);
         }
     }
@@ -355,6 +367,8 @@ void Position::do_move(Move m, StateInfo& newSt) {
     st->capturedPiece = captured;
     st->key = key;
     st->pawnKey = pawnKey;
+    st->nonPawnKey[WHITE] = npKey[WHITE];
+    st->nonPawnKey[BLACK] = npKey[BLACK];
     sideToMove = them;
 
     if (nn) NNUE::end_move(*this);

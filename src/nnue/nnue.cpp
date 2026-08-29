@@ -49,6 +49,12 @@ constexpr int BUCKETS[64] = {
 // akimbo SEE values (index by H2-Classical PieceType) for the material scale.
 constexpr int SeeVal[PIECE_TYPE_NB] = { 0, 100, 450, 450, 650, 1250, 0, 0 };
 
+// Whether NNUE::evaluate applies akimbo's material output scaling. MUST match
+// the embedded net: true for the akimbo net (net_akimbo.bin.bak), false for a
+// net trained on our own datagen labels. Getting this wrong is silent — the
+// engine still plays, just with systematically mis-scaled eval.
+constexpr bool MaterialScaling = true;
+
 // ---- Loaded network (views into embedded bytes or a heap buffer) ----
 using Row = int16_t[HIDDEN];
 const Row* featureWeights = nullptr;      // [INPUT * NUM_BUCKETS][HIDDEN]
@@ -290,13 +296,21 @@ Value evaluate(const Position& pos) {
     int32_t eval = pos.side_to_move() == WHITE ? output(wPersp, bPersp)
                                                : output(bPersp, wPersp);
 
-    // akimbo material output scaling.
-    int mat = popcount(pos.pieces(KNIGHT)) * SeeVal[KNIGHT]
-            + popcount(pos.pieces(BISHOP)) * SeeVal[BISHOP]
-            + popcount(pos.pieces(ROOK))   * SeeVal[ROOK]
-            + popcount(pos.pieces(QUEEN))  * SeeVal[QUEEN];
-    mat = 700 + mat / 32;
-    return Value(eval * mat / 1024);
+    // akimbo material output scaling. Correct for akimbo's net, which was
+    // trained against targets that did NOT include it, but wrong for a net
+    // trained on OUR datagen labels: those labels are engine search scores that
+    // already passed through this scaling, so a self-trained net learns it and
+    // applying it again here would double-apply (damping eval by 0.68-0.95x).
+    // Toggled with the net, not independently — see MaterialScaling below.
+    if (MaterialScaling) {
+        int mat = popcount(pos.pieces(KNIGHT)) * SeeVal[KNIGHT]
+                + popcount(pos.pieces(BISHOP)) * SeeVal[BISHOP]
+                + popcount(pos.pieces(ROOK))   * SeeVal[ROOK]
+                + popcount(pos.pieces(QUEEN))  * SeeVal[QUEEN];
+        mat = 700 + mat / 32;
+        return Value(eval * mat / 1024);
+    }
+    return Value(eval);
 }
 
 // ---- Incremental accumulator interface ----

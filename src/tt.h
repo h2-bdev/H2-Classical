@@ -18,15 +18,26 @@ struct TTEntry {
     int16_t  value16;
     int16_t  eval16;
     int8_t   depth8;
-    uint8_t  genBound8; // bits 0-1 bound, bits 2-7 generation
+    // bits 0-1 bound, bit 2 ttPv, bits 3-7 generation.
+    //
+    // The pv bit was carved out of the generation field (2026-08-20), which
+    // dropped from 6 bits to 5 -- so the generation now wraps every 32
+    // searches instead of 64. That is harmless: it is only ever used as a
+    // RELATIVE age in probe(), where the difference is taken mod 256 and
+    // compared against entry depths that never approach 32 anyway. The
+    // alternative, a separate byte, would have pushed the entry to 11 bytes
+    // and broken the 3-entries-plus-2-padding = 32-byte cluster.
+    uint8_t  genBound8;
 
     Move  move() const  { return Move(move16); }
     Value value() const { return Value(value16); }
     Value eval() const  { return Value(eval16); }
     int   depth() const { return depth8; }
     Bound bound() const { return Bound(genBound8 & 0x3); }
+    // Was this position ever part of a PV line? Sticky across overwrites.
+    bool  is_pv() const { return (genBound8 & 0x4) != 0; }
 
-    void save(uint64_t key, Value v, Bound b, int d, Move m, Value ev, uint8_t generation);
+    void save(uint64_t key, Value v, Bound b, int d, Move m, Value ev, bool pv, uint8_t generation);
 
     static uint16_t data_mix(uint16_t move16, int16_t value16, int16_t eval16,
                               int8_t depth8, uint8_t genBound8) {
@@ -47,7 +58,7 @@ public:
 
     void resize(size_t mb);
     void clear();
-    void new_search() { generation8 += 4; } // low 2 bits reserved for bound
+    void new_search() { generation8 += 8; } // low 3 bits reserved for bound + pv
     uint8_t generation() const { return generation8; }
 
     // Returns the matching entry (found=true) or the replacement target.
