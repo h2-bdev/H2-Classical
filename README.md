@@ -5,6 +5,6 @@ Nature uses a pre-installed open-source NNUE, as where BravoBlue (in development
 # Description of H2-Classical
 A chess engine written in C++, using an akimbo bullet NNUE net, Native 3·4·5 SyZyGy database, with HCE as a fallback.
 ## Version 1.0
-Added GitHub repo and website at: "WIP"
+Added GitHub repo and website at: "https://h2chess.vercel.app"
 ## What will be released in version 1.1?
 Performance patches and features.
