@@ -184,6 +184,74 @@ struct EvalTables {
 };
 const EvalTables evalTables;
 
+// ---- Pawn hash -------------------------------------------------------------
+// Pawn structure changes far less often than piece placement -- most moves in a
+// search leave it untouched -- so the same pawn skeleton is otherwise
+// re-evaluated thousands of times per node tree. Cache it, keyed by the
+// incrementally-maintained pawn Zobrist key (Position::pawn_key()).
+//
+// Only terms that are a pure function of PAWN placement live in here. The
+// blocked-passer discount reads enemy piece placement, so it is deliberately
+// excluded and applied by the caller; the entry carries the passer bitboard so
+// that correction stays cheap.
+//
+// No generation/versioning: the key is checked on every probe, so a collision
+// or a stale slot simply recomputes. thread_local because H2-Classical runs a
+// Lazy-SMP helper worker, and two workers sharing one table would hand each
+// other another position's pawn score -- a silent wrong eval, not a crash.
+struct PawnEntry {
+    uint64_t key;
+    int      mg[COLOR_NB];
+    int      eg[COLOR_NB];
+    Bitboard passers[COLOR_NB];
+};
+
+constexpr size_t PawnTableSize = 1 << 14;   // 16k entries, ~640 KB
+thread_local PawnEntry pawnTable[PawnTableSize];
+
+const PawnEntry& probe_pawns(const Position& pos, const Bitboard pawns[COLOR_NB],
+                             const Bitboard pawnAtt[COLOR_NB]) {
+    const uint64_t key = pos.pawn_key();
+    PawnEntry& e = pawnTable[key & (PawnTableSize - 1)];
+    if (e.key == key)
+        return e;
+
+    e.key = key;
+    for (Color c : { WHITE, BLACK }) {
+        Color them = ~c;
+        e.mg[c] = e.eg[c] = 0;
+        e.passers[c] = 0;
+
+        Bitboard b = pawns[c];
+        while (b) {
+            Square s = pop_lsb(b);
+            Rank rr = relative_rank(c, s);
+
+            if (!(pawns[them] & PassedMask[c][s])) {
+                e.mg[c] += PassedMg[rr];
+                e.eg[c] += PassedEg[rr];       // UNBLOCKED value; caller discounts
+                e.passers[c] |= square_bb(s);
+            }
+            if (!(pawns[c] & IsolatedMask[file_of(s)])) {
+                e.mg[c] += IsolatedMg;
+                e.eg[c] += IsolatedEg;
+            }
+            if (pawns[c] & ForwardFileMask[c][s]) { // another own pawn ahead = doubled
+                e.mg[c] += DoubledMg;
+                e.eg[c] += DoubledEg;
+            }
+            // Connected: defended by an own pawn, or a phalanx neighbor.
+            bool supported = pawnAtt[c] & square_bb(s);
+            bool phalanx   = pawns[c] & IsolatedMask[file_of(s)] & rank_bb(s);
+            if (supported || phalanx) {
+                e.mg[c] += ConnectedBonus[rr];
+                e.eg[c] += ConnectedBonus[rr] / 2;
+            }
+        }
+    }
+    return e;
+}
+
 } // namespace
 
 Value evaluate(const Position& pos) {
@@ -219,6 +287,32 @@ Value evaluate(const Position& pos) {
         pawnAtt[BLACK] | BB::PseudoAttacks[KING][kingSq[BLACK]]
     };
 
+    // Pawn-structure terms come from the hash below rather than the piece loop.
+    // Everything it returns is a pure function of pawn placement; the one term
+    // that is NOT (the blocked-passer discount, which reads enemy PIECE
+    // placement) is applied outside the cache, using the passer bitboard the
+    // entry carries for exactly that purpose.
+    const PawnEntry& pe = probe_pawns(pos, pawns, pawnAtt);
+    for (Color c : { WHITE, BLACK }) {
+        mg[c] += pe.mg[c];
+        eg[c] += pe.eg[c];
+
+        // Blocked passer: worth less, especially in the endgame where it wants
+        // to run. The cache stored the UNBLOCKED value, so subtract the
+        // difference. Written as (v*2/3 - v) rather than -(v/3) because integer
+        // division does not distribute -- for v=10 those differ (6 vs 7) and the
+        // result would no longer be bit-identical to the pre-cache evaluation.
+        Bitboard p = pe.passers[c];
+        while (p) {
+            Square s = pop_lsb(p);
+            Square front = s + pawn_push(c);
+            if (square_ok(front) && (pos.pieces(~c) & square_bb(front))) {
+                int v = PassedEg[relative_rank(c, s)];
+                eg[c] += v * 2 / 3 - v;
+            }
+        }
+    }
+
     for (Color c : { WHITE, BLACK }) {
         Color them = ~c;
         // Mobility area: exclude own pawns/king and squares attacked by enemy pawns.
@@ -248,35 +342,6 @@ Value evaluate(const Position& pos) {
                     if (onRing) {
                         kingAttackers[them]++;
                         kingAttackUnits[them] += KingAttackWeight[pt] * popcount(onRing);
-                    }
-                }
-
-                if (pt == PAWN) {
-                    Rank rr = relative_rank(c, s);
-                    if (!(pawns[them] & PassedMask[c][s])) {
-                        mg[c] += PassedMg[rr];
-                        // Blocked passer (enemy piece on the stop square) is worth
-                        // less, especially in the endgame where it wants to run.
-                        Square front = s + pawn_push(c);
-                        int eb = PassedEg[rr];
-                        if (square_ok(front) && (pos.pieces(them) & square_bb(front)))
-                            eb = eb * 2 / 3;
-                        eg[c] += eb;
-                    }
-                    if (!(pawns[c] & IsolatedMask[file_of(s)])) {
-                        mg[c] += IsolatedMg;
-                        eg[c] += IsolatedEg;
-                    }
-                    if (pawns[c] & ForwardFileMask[c][s]) { // another own pawn ahead = doubled
-                        mg[c] += DoubledMg;
-                        eg[c] += DoubledEg;
-                    }
-                    // Connected: defended by an own pawn, or a phalanx neighbor.
-                    bool supported = pawnAtt[c] & square_bb(s);
-                    bool phalanx   = pawns[c] & IsolatedMask[file_of(s)] & rank_bb(s);
-                    if (supported || phalanx) {
-                        mg[c] += ConnectedBonus[rr];
-                        eg[c] += ConnectedBonus[rr] / 2;
                     }
                 }
 
