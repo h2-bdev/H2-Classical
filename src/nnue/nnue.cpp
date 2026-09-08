@@ -2,6 +2,7 @@
 
 #include "../position.h"
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -65,6 +66,15 @@ bool loaded = false;
 
 std::vector<unsigned char> fileBuf;       // backing store for an EvalFile override
 
+// Bumped whenever the network weights change (init, or an EvalFile override).
+// The refresh cache below stores accumulators built from a specific weight set,
+// so every cached entry must be discarded when the net is swapped. A counter
+// rather than a direct reset because the cache is thread_local: a swap happens
+// on one thread but must invalidate every thread's copy, and each thread can
+// only clear its own. Entries carry the generation they were built under and
+// re-seed themselves lazily on mismatch.
+std::atomic<uint32_t> netGeneration{ 1 };
+
 constexpr size_t NET_BYTES =
     size_t(INPUT * NUM_BUCKETS) * HIDDEN * sizeof(int16_t)  // feature_weights
     + size_t(HIDDEN) * sizeof(int16_t)                      // feature_bias
@@ -81,6 +91,7 @@ void map_net(const unsigned char* base) {
     p += size_t(2) * HIDDEN;
     outputBias = *p;
     loaded = true;
+    netGeneration.fetch_add(1, std::memory_order_relaxed);
 }
 
 // SCReLU flatten: sum_i clamp(acc[i],0,QA)^2 * weight[i].
@@ -233,6 +244,76 @@ void refresh_perspective(Accumulator& a, int P, const Position& pos, Square ksq)
     a.key[P] = king_key(P, ksq);
 }
 
+// ---- Refresh cache ("Finny table") ----
+// A king-bucket crossing invalidates every feature index for that perspective,
+// so the accumulator has to be rebuilt. Rebuilding from the bias costs one row
+// add per piece on the board; but the king usually crosses back and forth over
+// the same boundary within a search, so the *previous* accumulator for the
+// bucket being re-entered is nearly always a much closer starting point than
+// the bias is.
+//
+// So keep one cached accumulator per (perspective, king_key) — where king_key
+// is exactly the bucket+mirror pair that determines the feature indices, hence
+// every position sharing a key also shares its feature mapping — along with the
+// board it was built from. On re-entry, diff the cached board against the
+// current one and apply only the delta.
+//
+// This is an inference-path optimization only: the resulting accumulator is
+// identical to what refresh_perspective() would have produced, so eval and the
+// bench node signature must not move. An empty (freshly seeded) entry degrades
+// exactly to the old full rebuild, since diffing against an empty board adds
+// every piece once.
+constexpr int FINNY_KEYS = NUM_BUCKETS * 2;   // king_key() = bucket * 2 + mirror
+
+struct FinnyEntry {
+    int16_t  v[HIDDEN];
+    Bitboard bb[COLOR_NB][PIECE_TYPE_NB];  // board this accumulator was built from
+    uint32_t gen = 0;                      // netGeneration it was built under
+};
+
+// thread_local for the same reason accStack is (see above): two Lazy-SMP
+// workers must never share accumulator state.
+thread_local FinnyEntry finny[2][FINNY_KEYS];
+
+// Rebuild perspective P of `a` via the refresh cache. Equivalent to
+// refresh_perspective(), just usually cheaper.
+void refresh_cached(Accumulator& a, int P, const Position& pos, Square ksq) {
+    const int key = king_key(P, ksq);
+    FinnyEntry& e = finny[P][key];
+
+    const uint32_t gen = netGeneration.load(std::memory_order_relaxed);
+    if (e.gen != gen) {
+        // Never used, or built under a different net: re-seed to "bias, empty
+        // board". The diff below then adds every piece, reproducing a full
+        // rebuild exactly.
+        std::memcpy(e.v, featureBias, sizeof(e.v));
+        std::memset(e.bb, 0, sizeof(e.bb));
+        e.gen = gen;
+    }
+
+    for (Color c : { WHITE, BLACK })
+        for (PieceType pt = PAWN; pt <= KING; ++pt) {
+            const Piece    pcp = make_piece(c, pt);
+            const Bitboard cur = pos.pieces(c, pt);
+            const Bitboard old = e.bb[c][pt];
+
+            Bitboard removed = old & ~cur;
+            while (removed) {
+                int sq = pop_lsb(removed);
+                sub_row(e.v, featureWeights[feature_row(P, pcp, Square(sq), ksq)]);
+            }
+            Bitboard added = cur & ~old;
+            while (added) {
+                int sq = pop_lsb(added);
+                add_row(e.v, featureWeights[feature_row(P, pcp, Square(sq), ksq)]);
+            }
+            e.bb[c][pt] = cur;
+        }
+
+    std::memcpy(a.v[P], e.v, sizeof(a.v[P]));
+    a.key[P] = key;
+}
+
 void refresh_full(Accumulator& a, const Position& pos) {
     refresh_perspective(a, 0, pos, pos.square<KING>(WHITE));
     refresh_perspective(a, 1, pos, pos.square<KING>(BLACK));
@@ -335,7 +416,7 @@ void end_move(const Position& pos) {
     for (int P = 0; P < 2; ++P) {
         int nk = king_key(P, ksq[P]);
         if (nk != parent.key[P]) {
-            refresh_perspective(cur, P, pos, ksq[P]); // king changed bucket → rebuild
+            refresh_cached(cur, P, pos, ksq[P]); // king changed bucket → rebuild
             continue;
         }
         std::memcpy(cur.v[P], parent.v[P], sizeof(cur.v[P]));
