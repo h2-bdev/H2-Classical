@@ -25,3 +25,37 @@ cc-nnue-threadlocal     1703779     NNUE accumulator state made thread_local (di
 cc-lazysmp-2t           1703779     2nd Lazy-SMP worker thread + Threads UCI option (max 2); Position made copyable (2nd blocker fix)
                                      quick-gate Threads=2 vs Threads=1: +46.6 +/-39.8 Elo, 56.67%, LOS 99.0%
 cc-skill-contempt       1703779     Skill Level (depth cap) + Contempt (draw-score bias) options (correctness-only, no-op at defaults)
+cc-ponderhit            1703779     UCI `ponderhit` implemented + join_search() deadlock fix (correctness-only, bit-identical
+                                     no-op). SHIPPED to the live bot 2026-08-31 from a clean-HEAD worktree, so this line is
+                                     the signature of the binary now in lichess-bot/engines/H2-Classical.
+(no commit)             1505550     NEGATIVE RESULT 2026-08-31, RE-DERIVED AND STRENGTHENED 2026-09-01.
+                                     -mcpu=apple-m3 vs -mcpu=apple-m1 produces a BYTE-IDENTICAL binary. Proven directly,
+                                     not benchmarked: both builds md5 to 119b12258ab2556d646db0ba82d7c61d. Adding -mcpu to
+                                     LDFLAGS as well (see below) changes nothing -- still the same md5. Control: -O2 vs -O3
+                                     DOES change the md5 (0df75ea9... vs 119b1225...), so the build genuinely responds to
+                                     flags and the null result is real, not a broken experiment.
+                                     => There is nothing to measure. No nps comparison between these two flags can be
+                                        anything but noise, because it is the same machine code executed twice.
+                                     WHY: apple-m1 exposes only DOTPROD; apple-m2/m3/native additionally define
+                                     __ARM_FEATURE_MATMUL_INT8 + __ARM_FEATURE_BF16 (the M3 reports FEAT_DotProd/FEAT_I8MM/
+                                     FEAT_BF16 = 1; SVE/SVE2/SME absent -- and AVX-512 is x86-only, it does not exist here).
+                                     But nnue.cpp uses explicit int16 intrinsics (vld1q_s16/vmulq_s32/vmovl_s16) and
+                                     SDOT/SMMLA are int8 instructions. The compiler cannot invent an int8 quantisation, so
+                                     the extra features are unreachable from this source and codegen is unchanged.
+                                     BUILD-SYSTEM NOTE worth keeping: with -flto the .o files are LLVM bitcode and real
+                                     codegen happens at LINK time, but LDFLAGS := -flto carries no -mcpu. So the link line is
+                                     `c++ -flto <objs> -o build/H2-Classical`. That looked like the explanation for the null
+                                     result; it is NOT (adding it to LDFLAGS changed nothing), but if a future -mcpu/-march
+                                     experiment ever DOES matter, it must set the flag in LDFLAGS too or it will silently
+                                     have no effect.
+                                     SUPERSEDED CLAIMS from the 2026-08-31 pass, both wrong, both my error: "m3 is 14%
+                                     slower" (non-interleaved, measured system load) and "max-of-12 gives m3 +0.43%"
+                                     (interleaved, but comparing a binary against itself). An interleaved run swung
+                                     -41.6%..+59.1% with the SAME binary ranging 577K..1355K nps, because macOS schedules
+                                     bench onto P- or E-cores (E-cores ~1/3 the speed) while other work competes.
+                                     MEASUREMENT RULE that survives: any nps comparison on this box MUST use max-of-N with
+                                     nothing else running -- and FIRST check whether the two binaries even differ. A one-line
+                                     md5 would have replaced the entire 2026-08-31 benchmarking session.
+                                     Real speed levers instead: (1) BravoBlue's missing incremental accumulator, 567K vs
+                                     Nature's ~1.3M nps -- a ~2x gap from absent code; (2) int8 requantisation to reach
+                                     SDOT/SMMLA, which needs a retrain (QA=255 does not fit int8), not a flag.

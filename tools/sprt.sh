@@ -79,8 +79,31 @@ cmd_run() {
         echo "warning: no opening book at $book — using startpos (bad for SPRT variance)"
     fi
 
+    # Tablebases are deliberately OFF for A/B testing, and pinned explicitly
+    # rather than left to whatever each binary defaults to. Reasons:
+    #   1. Both sides must be identical; a baseline built when the path was
+    #      valid would otherwise probe while the dev build did not.
+    #   2. TB answers endgames exactly, which masks precisely the endgame eval
+    #      differences a search/eval patch is trying to move -- it costs
+    #      measurement sensitivity where this engine is currently weakest.
+    # Live play is the opposite case: ../lichess-bot/config.yml SETS SyzygyPath,
+    # because in a real game an exact answer beats a good guess.
+    # Off by default; set SYZYGY=<path> to enable for BOTH engines equally.
+    # NOTE: both array expansions below use ${arr[@]+"${arr[@]}"} rather than a
+    # plain "${arr[@]}". macOS ships bash 3.2, where `set -u` treats expanding an
+    # EMPTY array as an unbound variable and aborts the script -- so with no
+    # SYZYGY set (the default!) this died before launching a single game, while
+    # still exiting 0 from a background wrapper. Do not "simplify" these back.
+    local tb_args=() tb_state="OFF (default)"
+    if [[ -n "${SYZYGY:-}" ]]; then
+        [[ -d "$SYZYGY" ]] || die "SYZYGY path does not exist: $SYZYGY"
+        tb_args=("option.SyzygyPath=$SYZYGY")
+        tb_state="ON  -> $SYZYGY"
+    fi
+
     echo "SPRT: dev=$DEV_BIN"
     echo "      base=$base_bin"
+    echo "      tablebases=$tb_state"
     echo "      tc=$tc  bounds=[$elo0, $elo1]  alpha=$alpha  beta=$beta"
     echo "      rounds<=$rounds  concurrency=$concurrency  hash=${hash}MB  threads=$threads"
     echo
@@ -88,13 +111,13 @@ cmd_run() {
     exec "$FASTCHESS" \
         -engine "cmd=$DEV_BIN"  "name=dev" \
         -engine "cmd=$base_bin" "name=base" \
-        -each "tc=$tc" "proto=uci" "option.Hash=$hash" "option.Threads=$threads" \
+        -each "tc=$tc" "proto=uci" "option.Hash=$hash" "option.Threads=$threads" ${tb_args[@]+"${tb_args[@]}"} \
         -rounds "$rounds" -games 2 -repeat -concurrency "$concurrency" \
         -sprt "elo0=$elo0" "elo1=$elo1" "alpha=$alpha" "beta=$beta" "model=normalized" \
         -resign movecount=4 score=700 twosided=true \
         -draw movenumber=40 movecount=10 score=8 \
         -ratinginterval 10 \
-        "${book_args[@]}"
+        ${book_args[@]+"${book_args[@]}"}
 }
 
 case "${1:-run}" in

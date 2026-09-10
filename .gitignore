@@ -20,3 +20,11 @@ src/nnue/*.o
 .vscode/
 .clangd
 CLAUDE.md
+
+# SPSA run artifacts — regenerated every run, pure churn in diffs.
+tools/spsa.log
+tools/spsa.out
+tools/spsa_state.json
+tools/spsa_result.json
+tools/.sprt_state.json
+tools/.sprt_state.md5
