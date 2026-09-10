@@ -14,45 +14,62 @@ Live progress: appends to tools/spsa.log and rewrites tools/spsa_state.json
 (resumable) + tools/spsa_result.json (current best-estimate theta, ready to paste
 as engine defaults). Ctrl-C stops cleanly and writes the result.
 
+The tunable list is read out of the engine's own `uci` handshake at startup, so
+it can never drift from TUNE_PARAMS in src/search.cpp.
+
 Usage:
-  tools/spsa.py --iters 500            # real run
-  tools/spsa.py --smoke                # 2 tiny iters to validate the pipeline
-  tools/spsa.py --iters 500 --resume   # continue from tools/spsa_state.json
+  tools/spsa.py --iters 500              # real run
+  tools/spsa.py --iters 250 --minutes 60 # run for one hour, then stop cleanly
+  tools/spsa.py --smoke                  # 2 tiny iters to validate the pipeline
+  tools/spsa.py --iters 500 --resume     # continue from tools/spsa_state.json
 """
-import argparse, json, os, random, re, subprocess, sys, signal
+import argparse, json, os, random, re, subprocess, sys, signal, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ENGINE_DIR = os.path.dirname(HERE)
-BIN = os.path.join(ENGINE_DIR, "build", "carelesschess")
+BIN = os.path.join(ENGINE_DIR, "build", "MC-Nature")
 FASTCHESS = os.path.join(HERE, "fastchess", "fastchess")
 BOOK = os.path.join(HERE, "books", "8moves_v3.pgn")
 LOG = os.path.join(HERE, "spsa.log")
 STATE = os.path.join(HERE, "spsa_state.json")
 RESULT = os.path.join(HERE, "spsa_result.json")
 
-# name, default, lo, hi  -- must mirror TUNE_PARAMS in src/search.cpp.
-PARAMS = [
-    ("RfpMargin",      80,   20,   200),
-    ("RfpMarginImp",   60,   20,   200),
-    ("NullBase",        3,    1,     6),
-    ("NullDepthDiv",    6,    3,    12),
-    ("NullEvalDiv",   200,   80,   400),
-    ("ProbCutMargin", 250,  120,   400),
-    ("ProbCutImp",     60,    0,   140),
-    ("FutBase",       150,   50,   350),
-    ("FutScale",      100,   40,   220),
-    ("HistPruneMul", 4000, 1500,  8000),
-    ("SeeCapMul",      50,   15,   130),
-    ("SeeQuietMul",    60,   15,   130),
-    ("LmrHistDiv",   8192, 3072, 16384),
-    ("LmrDivX100",    210,  160,   280),
-    ("AspDelta",       12,    6,    30),
-    ("HistBonusMul",    4,    2,     9),
-    ("HistBonusMax", 8000, 4000, 14000),
-    ("SingularMul",     2,    1,     5),
-    ("LmpBase",         3,    1,     7),
-    ("LmpImpBase",      4,    1,     9),
-]
+# Standard UCI options the engine advertises that are NOT search tunables.
+# Everything else in the `uci` handshake is treated as a TUNE_PARAMS entry.
+NON_TUNABLE = {
+    "hash", "move overhead", "syzygypath", "syzygyprobelimit", "evalfile",
+    "threads", "ponder", "multipv", "skill level", "contempt",
+    "uci_limitstrength", "uci_elo", "uci_variant", "clear hash",
+}
+
+
+def discover_params(binary):
+    """Read the tunables straight out of the engine's `uci` handshake.
+
+    The previous hardcoded table silently drifted out of sync with
+    TUNE_PARAMS in src/search.cpp -- it was missing RazorMargin and still
+    carried the pre-tune defaults, so a run would have tuned the wrong
+    starting point against the wrong parameter set. Deriving the list makes
+    that class of bug impossible.
+
+    Returns [(name, default, lo, hi), ...] in the engine's own order.
+    """
+    out = subprocess.run([binary], input="uci\nquit\n", capture_output=True,
+                         text=True, timeout=60).stdout
+    params = []
+    pat = re.compile(
+        r"^option name (.+?) type spin default (-?\d+) min (-?\d+) max (-?\d+)\s*$")
+    for line in out.splitlines():
+        m = pat.match(line.strip())
+        if m and m.group(1).strip().lower() not in NON_TUNABLE:
+            params.append((m.group(1).strip(), int(m.group(2)),
+                           int(m.group(3)), int(m.group(4))))
+    if not params:
+        sys.exit(f"[spsa] no tunable spin options found in {binary}'s uci output")
+    return params
+
+
+PARAMS = []  # filled in main() from the engine binary
 
 # SPSA knobs.
 NODES = 50000        # per-move node limit for each engine (fast, deterministic)
@@ -114,8 +131,13 @@ def play_batch(theta_plus, theta_minus, games):
 
 
 def main():
+    global PARAMS
     ap = argparse.ArgumentParser()
-    ap.add_argument("--iters", type=int, default=500)
+    ap.add_argument("--iters", type=int, default=500,
+                    help="iteration budget; also sets the learning-rate decay schedule")
+    ap.add_argument("--minutes", type=float, default=None,
+                    help="wall-clock cap. Stops cleanly after the iteration that "
+                         "crosses it, writing the result as usual.")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args()
@@ -124,9 +146,16 @@ def main():
         if not os.path.exists(path):
             sys.exit(f"[spsa] missing {what}: {path}")
 
+    PARAMS = discover_params(BIN)
+    print(f"[spsa] discovered {len(PARAMS)} tunables from {os.path.basename(BIN)}:",
+          flush=True)
+    for n, d, lo, hi in PARAMS:
+        print(f"         {n:<14} default={d:<6} [{lo}, {hi}]", flush=True)
+
     iters = 2 if args.smoke else args.iters
     games = 2 if args.smoke else GAMES_PER_ITER
     A = max(1, iters // 2)
+    deadline = time.time() + args.minutes * 60 if args.minutes else None
 
     theta = [float(d) for (_n, d, _lo, _hi) in PARAMS]
     start = 0
@@ -141,6 +170,10 @@ def main():
 
     for k in range(start, iters):
         if _stop:
+            break
+        if deadline and time.time() >= deadline:
+            print(f"[spsa] wall-clock cap reached after {k - start} iterations "
+                  f"this run", flush=True)
             break
         lr = LR0 * A / (A + k)
         delta = [random.choice((-1, 1)) for _ in PARAMS]

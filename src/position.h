@@ -14,6 +14,11 @@ struct StateInfo {
     // Copied / persistent across a move.
     uint64_t key;
     uint64_t pawnKey;   // Zobrist key over pawns only (for eval correction history).
+    // Zobrist key over each side's NON-pawn pieces (king included), for the
+    // non-pawn correction histories. Maintained everywhere pawnKey is; like
+    // pawnKey it needs no undo_move work, because undo restores by popping
+    // the StateInfo chain rather than by recomputing.
+    uint64_t nonPawnKey[COLOR_NB];
     int      castlingRights;
     Square   epSquare;
     int      rule50;
@@ -92,6 +97,7 @@ public:
     // Draw detection helpers.
     uint64_t key() const { return st->key; }
     uint64_t pawn_key() const { return st->pawnKey; }
+    uint64_t non_pawn_key(Color c) const { return st->nonPawnKey[c]; }
     int      rule50_count() const { return st->rule50; }
     bool     is_draw(int ply) const;
     bool     has_repeated() const;
