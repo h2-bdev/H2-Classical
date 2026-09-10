@@ -18,6 +18,8 @@
 namespace Search {
 
 std::atomic<bool> stop{false};
+std::atomic<bool> pondering{false};
+std::atomic<int64_t> ponderhitTime{0};
 TimeManager Time;
 int64_t nodes = 0;
 
@@ -178,6 +180,17 @@ public:
     void  update_pv(int ply, Move m);
     void  check_time();
 
+    // True while this search must ignore its clock because it is a `go ponder`
+    // search awaiting `ponderhit`. Also performs the one-time clock rebase at
+    // the moment the ponderhit is first observed, which is why it lives here
+    // rather than being a bare read of Search::pondering: the rebase must
+    // happen on the worker's own thread (each worker owns its TimeManager, so
+    // rebasing from the UCI thread would be a data race).
+    bool  ponder_wait();
+
+    // Per-worker latch for the rebase above. Reset at the top of every search.
+    bool  ponderRebased = false;
+
     void  score_moves(const Position& pos, ExtMove* begin, ExtMove* end, Move ttMove, Stack* ss);
     void  update_history(const Position& pos, Move m, int bonus);
     void  update_capture_history(const Position& pos, Move m, int bonus);
@@ -223,7 +236,23 @@ void SearchWorker::update_pv(int ply, Move m) {
     pvLen[ply] = pvLen[ply + 1] + 1;
 }
 
+bool SearchWorker::ponder_wait() {
+    if (!limits.ponder)
+        return false;
+    // Acquire pairs with the release store in the `ponderhit` handler, so the
+    // ponderhitTime read below cannot be reordered ahead of it.
+    if (pondering.load(std::memory_order_acquire))
+        return true;
+    if (!ponderRebased) {
+        Time.rebase(ponderhitTime.load(std::memory_order_relaxed));
+        ponderRebased = true;
+    }
+    return false;
+}
+
 void SearchWorker::check_time() {
+    if (ponder_wait())
+        return;
     if (limits.infinite)
         return;
     if ((nodes & 2047) == 0) {
@@ -807,6 +836,7 @@ void SearchWorker::think(Position& pos, const Limits& lim) {
     nodes = 0;
     selDepth = 0;
     multiPvExcludedCount = 0;
+    ponderRebased = false;
     stop.store(false, std::memory_order_relaxed);
     rootColor = pos.side_to_move();
     rootBestMove = MOVE_NONE;
@@ -968,7 +998,10 @@ void SearchWorker::think(Position& pos, const Limits& lim) {
         // iteration typically costs about as much as everything so far),
         // scaled by best-move stability: a flip-flopping PV searches longer,
         // a settled PV bails sooner.
-        if ((limits.useTimeManager || limits.movetime) && !limits.infinite) {
+        // `ponder_wait()` is checked here as well as in check_time() because a
+        // ponderhit can land between two node-count checks, and this is where
+        // the iteration-level bail lives; whichever sees it first rebases.
+        if ((limits.useTimeManager || limits.movetime) && !limits.infinite && !ponder_wait()) {
             int64_t softLimit;
             if (limits.movetime) {
                 softLimit = Time.soft_ms();
@@ -1034,6 +1067,7 @@ void SearchWorker::think_helper(Position pos, const Limits& lim, int depthOffset
     nodes = 0;
     selDepth = 0;
     multiPvExcludedCount = 0;
+    ponderRebased = false;
     rootColor = pos.side_to_move();
     rootBestMove = MOVE_NONE;
     rootBestValue = -VALUE_INFINITE;

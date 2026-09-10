@@ -23,8 +23,16 @@ size_t  g_hashMb = 64;
 std::thread g_searchThread;
 
 void join_search() {
-    if (g_searchThread.joinable())
+    if (g_searchThread.joinable()) {
+        // Signal before joining. A `go infinite` or `go ponder` search has no
+        // deadline of its own, so a bare join() deadlocks the UCI loop: this is
+        // reachable on a ponder MISS, where the GUI sends `position`+`go` for
+        // the move actually played. Clearing `pondering` first also re-arms the
+        // clock, so the search cannot outlive this call.
+        Search::pondering.store(false, std::memory_order_release);
+        Search::stop.store(true, std::memory_order_relaxed);
         g_searchThread.join();
+    }
 }
 } // namespace
 
@@ -115,10 +123,19 @@ void go(Position& pos, std::istringstream& is) {
     }
 
     limits.useTimeManager = (limits.time[WHITE] || limits.time[BLACK]);
-    if (limits.ponder)
-        limits.infinite = true; // see the comment on Limits::ponder in timeman.h
 
+    // Reap any previous search FIRST: join_search() force-clears `pondering`,
+    // so arming it before that call would let the old search's teardown stomp
+    // the new search's ponder state. (Unreachable via lichess-bot, which always
+    // sends `position` first, but nothing here enforces that ordering.)
     join_search();
+
+    // Then arm (or disarm) ponder mode, still before the thread is spawned, so
+    // a `ponderhit` arriving immediately cannot be missed. A plain `go` clears
+    // the flag, so stale ponder state can never leak into the next search.
+    // See the comment on Limits::ponder in timeman.h.
+    Search::pondering.store(limits.ponder, std::memory_order_release);
+
     g_searchThread = std::thread([&pos, limits]() { Search::think(pos, limits); });
 }
 
@@ -198,7 +215,18 @@ void uci_loop() {
                       << (NNUE::active() ? " (nnue)" : " (hce)") << std::endl;
         } else if (token == "d" || token == "print") {
             std::cout << pos.fen() << std::endl;
+        } else if (token == "ponderhit") {
+            // The move we were pondering was actually played. The search keeps
+            // running -- deliberately NO join_search() here -- but its clock
+            // now applies. Store the instant first, then release the flag, so
+            // a worker that observes pondering==false sees a valid timestamp.
+            Search::ponderhitTime.store(TimeManager::now(), std::memory_order_relaxed);
+            Search::pondering.store(false, std::memory_order_release);
         } else if (token == "stop") {
+            // Also drop ponder mode: `stop` during a ponder must produce a
+            // bestmove, and leaving the flag set would keep the clock disarmed
+            // for a search that is already being torn down.
+            Search::pondering.store(false, std::memory_order_release);
             Search::stop.store(true, std::memory_order_relaxed);
             join_search();
         } else if (token == "quit") {

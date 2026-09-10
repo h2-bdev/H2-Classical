@@ -22,12 +22,12 @@ struct Limits {
     Move searchMoves[MAX_MOVES];
     int  searchMovesCount = 0;
 
-    // True for `go ponder`. Handled as a plain infinite search (run until an
-    // external `stop`, or a fresh `position`+`go`) — this engine doesn't
-    // implement true ponderhit continuation, so this is the minimally
-    // correct behavior: it stops the engine from treating the opponent's
-    // clock as its own move-decision budget and returning an immediate
-    // bestmove mid-ponder, without pretending to do more than that.
+    // True for `go ponder`: search the predicted position on the opponent's
+    // clock. The search runs unlimited while `Search::pondering` is set, and
+    // `ponderhit` clears that flag to start the real budget (see
+    // SearchWorker::ponder_wait). Do NOT fold this into `infinite` — that was
+    // the old behaviour, and because no `ponderhit` handler existed the search
+    // stayed untimed forever and the engine lost on time in a real game.
     bool ponder = false;
 };
 
@@ -35,6 +35,14 @@ class TimeManager {
 public:
     void init(const Limits& limits, Color us);
     void start() { startTime = now(); }
+
+    // Move the clock's origin forward to `t`, used at `ponderhit`: the budget
+    // computed at `go ponder` is still valid (our clock did not run while the
+    // opponent thought), so it should be spent from the ponderhit instant
+    // rather than from the start of the ponder. Never moves the origin
+    // backwards, so a `ponderhit` racing ahead of `start()` can only leave the
+    // normal budget intact, never grant more than a fresh search would get.
+    void rebase(int64_t t) { if (t > startTime) startTime = t; }
 
     int64_t elapsed() const { return now() - startTime; }
     int64_t soft_ms() const { return optimumMs; }

@@ -14,6 +14,16 @@ struct StateInfo;
 namespace Search {
 
 extern std::atomic<bool> stop;
+
+// `go ponder` state. Set by the UCI layer before a ponder search starts and
+// cleared by `ponderhit`; while set, every worker ignores its clock. Written
+// only by the UCI thread, read by the search threads.
+extern std::atomic<bool> pondering;
+
+// The instant (TimeManager::now(), ms) at which `ponderhit` arrived. Stored
+// BEFORE `pondering` is cleared, and read with matching acquire ordering, so a
+// worker that observes pondering==false always sees a valid timestamp here.
+extern std::atomic<int64_t> ponderhitTime;
 extern TimeManager Time;
 extern int64_t nodes;
 
